@@ -53,3 +53,70 @@
 @keyframes it-spin {
     to { transform: rotate(360deg); }
 }
+
+/* ---------- Debug section ---------- */
+
+#it-settings .it-debug-section {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+#it-settings #it-debug-log {
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.78em;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-top: 4px;
+}
+
+#it-settings .it-debug-entry {
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    word-break: break-word;
+    line-height: 1.35;
+}
+
+#it-settings .it-debug-entry:last-child {
+    border-bottom: none;
+}
+
+#it-settings .it-debug-meta {
+    color: #888;
+    font-size: 0.85em;
+    margin-bottom: 2px;
+}
+
+#it-settings .it-debug-original {
+    color: #fca5a5;
+    white-space: pre-wrap;
+}
+
+#it-settings .it-debug-translated {
+    color: #86efac;
+    white-space: pre-wrap;
+}
+
+#it-settings .it-debug-error {
+    color: #ef4444;
+    font-style: italic;
+    font-size: 0.9em;
+    margin-top: 2px;
+}
+
+#it-settings .it-debug-note {
+    color: #93c5fd;
+    font-style: italic;
+    font-size: 0.9em;
+    margin-top: 2px;
+}
+
+#it-settings .it-debug-empty {
+    opacity: 0.5;
+    text-align: center;
+    padding: 12px;
+    font-style: italic;
+}
