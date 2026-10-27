@@ -13,6 +13,8 @@ import {
 const extensionName = 'inline-translator';
 const generateRawUnsafe = /** @type {any} */ (generateRaw);
 
+// ---------- defaults ----------
+
 const DEFAULT_SETTINGS = {
     enabled: true,
     mode: 'llm',
@@ -22,31 +24,22 @@ const DEFAULT_SETTINGS = {
     translateArabic: true,
     translateCjk: true,
     translateLatin: true,
+    translateOther: true,
     whitelist: 'HP, MP, XP, Lv, EXP, NPC, PvP, PvE, DnD, OOC, IC, PM, DM, GM',
     skipCodeBlocks: true,
-    skipReasoning: true,
+    skipTags: true,
     showIndicator: true,
     connectionProfileId: '',
 };
 
-// ---------- script ranges ----------
+// ---------- script classification ----------
 
-const ARABIC_RANGES = '\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF';
-const CJK_RANGES = '\\u4e00-\\u9fff\\u3040-\\u30ff\\uac00-\\ud7af\\u3000-\\u303f';
-const CYRILLIC_RANGES = '\\u0400-\\u04FF';
-
-const ARABIC_RE = new RegExp(`[${ARABIC_RANGES}]`);
-const CJK_RE = new RegExp(`[${CJK_RANGES}]`);
-const CYRILLIC_RE = new RegExp(`[${CYRILLIC_RANGES}]`);
-const LATIN_WORD_RE = /[A-Za-z][A-Za-z'\-]*/g;
-const ARABIC_RUN_RE = new RegExp(`[${ARABIC_RANGES}]+`, 'g');
-const CJK_RUN_RE = new RegExp(`[${CJK_RANGES}]+`, 'g');
-
-const REASONING_TAGS = 'think|thinking|reasoning|reason|thought|reflection';
-const PROTECTED_PATTERN_SOURCE =
-    `<details\\b[^>]*reason[^>]*>[\\s\\S]*?<\\/details>` +
-    `|<(?:${REASONING_TAGS})\\b[^>]*>[\\s\\S]*?<\\/(?:${REASONING_TAGS})>` +
-    `|\\[(?:${REASONING_TAGS})\\][\\s\\S]*?\\[\\/(?:${REASONING_TAGS})\\]`;
+const WORD_RE = /[\p{L}\p{M}'’\-]+/gu;
+const LETTER_RE = /\p{L}/u;
+const CYRILLIC_LETTER_RE = /\p{Script=Cyrillic}/u;
+const LATIN_LETTER_RE = /\p{Script=Latin}/u;
+const ARABIC_LETTER_RE = /\p{Script=Arabic}/u;
+const CJK_LETTER_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 const MAX_TOKEN_CALLS_PER_SENTENCE = 5;
 
@@ -97,7 +90,9 @@ function getExtensionProfileId() {
 function getExtensionProfileName() {
     const id = getExtensionProfileId();
     if (!id) return '';
-    const profile = extension_settings?.connectionManager?.profiles?.find((p) => p.id === id);
+    const profile = extension_settings?.connectionManager?.profiles?.find(
+        (p) => p.id === id,
+    );
     return profile?.name || '';
 }
 
@@ -146,48 +141,102 @@ function updateProfilesList() {
 
 // ---------- detection ----------
 
-function hasForeignScript(text) {
-    const s = getSettings();
-    if (s.translateArabic && ARABIC_RE.test(text)) return true;
-    if (s.translateCjk && CJK_RE.test(text)) return true;
+function wordHasForeignLetter(word) {
+    for (const ch of word) {
+        if (LETTER_RE.test(ch) && !CYRILLIC_LETTER_RE.test(ch)) return true;
+    }
     return false;
+}
+
+function classifyForeignWord(word) {
+    const hasCyr = CYRILLIC_LETTER_RE.test(word);
+    const hasLat = LATIN_LETTER_RE.test(word);
+    const hasAra = ARABIC_LETTER_RE.test(word);
+    const hasCjk = CJK_LETTER_RE.test(word);
+    const foreignCount = [hasLat, hasAra, hasCjk].filter(Boolean).length;
+    if (hasCyr) return 'mixed';
+    if (foreignCount > 1) return 'multi';
+    if (hasLat) return 'latin';
+    if (hasAra) return 'arabic';
+    if (hasCjk) return 'cjk';
+    return 'other';
+}
+
+function extractForeignTokensInSentence(sentence) {
+    const s = getSettings();
+    const tokens = [];
+    for (const m of sentence.matchAll(WORD_RE)) {
+        const word = m[0];
+        if (!wordHasForeignLetter(word)) continue;
+        if (isWhitelisted(word)) continue;
+
+        const script = classifyForeignWord(word);
+        if (script === 'latin' && !s.translateLatin) continue;
+        if (script === 'arabic' && !s.translateArabic) continue;
+        if (script === 'cjk' && !s.translateCjk) continue;
+        if (script === 'other' && !s.translateOther) continue;
+
+        tokens.push({ text: word, index: m.index, script });
+    }
+    return tokens;
 }
 
 function sentenceNeedsTranslation(text) {
     if (!text) return false;
-    if (hasForeignScript(text)) return true;
-    if (getSettings().translateLatin) {
-        const words = text.match(LATIN_WORD_RE) || [];
-        if (words.some((w) => !isWhitelisted(w))) return true;
-    }
-    return false;
+    return extractForeignTokensInSentence(text).length > 0;
 }
 
 function needsTranslation(text) {
     return sentenceNeedsTranslation(text);
 }
 
-// ---------- reasoning protection ----------
+// ---------- tag protection ----------
 
+/**
+ * Двухпроходная защита тегов:
+ *  1) все парные блоки <tag ...>…</tag> целиком (тег + содержимое);
+ *  2) оставшиеся одиночные/самозакрывающиеся <tag ...> / <tag ... /> в тексте.
+ * Возвращает массив сегментов: {type: 'text'|'protected', content}.
+ */
 function segmentText(text) {
     const s = getSettings();
-    if (!s.skipReasoning) return [{ type: 'text', content: text }];
-    const segments = [];
-    const regex = new RegExp(PROTECTED_PATTERN_SOURCE, 'gi');
+    if (!s.skipTags) return [{ type: 'text', content: text }];
+
+    // Pass 1: paired blocks
+    const pairedRe = /<(\w+)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
+    const parts = [];
     let lastIdx = 0;
     let match;
-    while ((match = regex.exec(text)) !== null) {
+    while ((match = pairedRe.exec(text)) !== null) {
         if (match.index > lastIdx) {
-            segments.push({ type: 'text', content: text.slice(lastIdx, match.index) });
+            parts.push({ type: 'text', content: text.slice(lastIdx, match.index) });
         }
-        segments.push({ type: 'protected', content: match[0] });
-        lastIdx = regex.lastIndex;
+        parts.push({ type: 'protected', content: match[0] });
+        lastIdx = pairedRe.lastIndex;
     }
     if (lastIdx < text.length) {
-        segments.push({ type: 'text', content: text.slice(lastIdx) });
+        parts.push({ type: 'text', content: text.slice(lastIdx) });
     }
-    if (segments.length === 0) segments.push({ type: 'text', content: text });
-    return segments;
+    if (parts.length === 0) parts.push({ type: 'text', content: text });
+
+    // Pass 2: leftover standalone tags inside text parts
+    const refined = [];
+    for (const seg of parts) {
+        if (seg.type === 'protected') { refined.push(seg); continue; }
+        const sub = seg.content;
+        const tagRe = /<\w+(?:\s[^>]*)?\/?>/gi;
+        let pos = 0;
+        let m;
+        while ((m = tagRe.exec(sub)) !== null) {
+            if (m.index > pos) refined.push({ type: 'text', content: sub.slice(pos, m.index) });
+            refined.push({ type: 'protected', content: m[0] });
+            pos = tagRe.lastIndex;
+        }
+        if (pos < sub.length) refined.push({ type: 'text', content: sub.slice(pos) });
+    }
+
+    if (refined.length === 0) refined.push({ type: 'text', content: text });
+    return refined;
 }
 
 // ---------- sentence splitting ----------
@@ -218,54 +267,6 @@ function findTranslatableSentences(text) {
         if (core && sentenceNeedsTranslation(core)) {
             result.push({ full: part, lead, trail, core });
         }
-    }
-    return result;
-}
-
-// ---------- foreign token extraction (translator mode) ----------
-
-function extractForeignTokensInSentence(sentence) {
-    const s = getSettings();
-    const tokens = [];
-    if (s.translateArabic) {
-        for (const m of sentence.matchAll(ARABIC_RUN_RE)) {
-            tokens.push({ text: m[0], index: m.index, script: 'arabic' });
-        }
-    }
-    if (s.translateCjk) {
-        for (const m of sentence.matchAll(CJK_RUN_RE)) {
-            tokens.push({ text: m[0], index: m.index, script: 'cjk' });
-        }
-    }
-    if (s.translateLatin) {
-        for (const m of sentence.matchAll(LATIN_WORD_RE)) {
-            if (!isWhitelisted(m[0])) {
-                tokens.push({ text: m[0], index: m.index, script: 'latin' });
-            }
-        }
-    }
-    if (tokens.length === 0) return [];
-
-    // Expand mixed-script tokens to whole words
-    const expanded = tokens.map((tok) => {
-        let start = tok.index;
-        let end = tok.index + tok.text.length;
-        while (start > 0 && /[^\s]/.test(sentence[start - 1])) start--;
-        while (end < sentence.length && /[^\s]/.test(sentence[end])) end++;
-        const word = sentence.slice(start, end);
-        if (CYRILLIC_RE.test(word)) {
-            return { text: word, index: start, script: 'mixed', originalText: tok.text };
-        }
-        return { text: tok.text, index: tok.index, script: tok.script };
-    });
-
-    expanded.sort((a, b) => a.index - b.index);
-    const result = [];
-    let lastEnd = -1;
-    for (const t of expanded) {
-        if (t.index < lastEnd) continue;
-        result.push(t);
-        lastEnd = t.index + t.text.length;
     }
     return result;
 }
@@ -315,9 +316,9 @@ async function safeGenerateRaw(promptText) {
 
 function buildLLMPrompt(items) {
     const list = items.map((it, i) => `${i + 1}. ${it}`).join('\n');
-    return `Ты — переводчик, встроенный в русскоязычный ролевой чат. Модель иногда вставляет в русский текст иноязычные слова (английский, китайский, японский, арабский).
+    return `Ты — переводчик, встроенный в русскоязычный ролевой чат. Модель иногда вставляет в русский текст иноязычные вставки. Это может быть ЛЮБОЙ язык (английский, китайский, японский, арабский, корейский, греческий, иврит и т.п.), и в одном предложении могут встретиться вставки с РАЗНЫХ языков одновременно.
 
-Твоя задача — вернуть ТО ЖЕ САМОЕ предложение, но с переведёнными на русский ТОЛЬКО теми частями, которые НЕ на русском.
+Твоя задача — вернуть ТО ЖЕ САМОЕ предложение, но с переведёнными на русский ТОЛЬКО теми частями, которые НЕ на русском. Каждую иноязычную вставку обрабатывай независимо от остальных.
 
 КРИТИЧЕСКИ ВАЖНО:
 - НЕ перефразируй русский текст.
@@ -392,7 +393,6 @@ async function translateViaGoogle(text, targetLang) {
             lastError = e;
         }
     }
-    // Fallback MyMemory
     try {
         const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=auto|${encodeURIComponent(targetLang)}`);
         if (!res.ok) throw new Error(`MyMemory HTTP ${res.status}`);
@@ -468,9 +468,10 @@ async function translateSentencesViaTranslator(text, sentences) {
             continue;
         }
 
-        // Fallback: too many tokens, or a mixed-word is present → translate whole sentence
         const hasMixed = tokens.some((t) => t.script === 'mixed');
-        if (tokens.length > MAX_TOKEN_CALLS_PER_SENTENCE || hasMixed) {
+        const hasMulti = tokens.some((t) => t.script === 'multi');
+
+        if (tokens.length > MAX_TOKEN_CALLS_PER_SENTENCE || hasMixed || hasMulti) {
             try {
                 const tr = await translateSingle(s.core);
                 const cleaned = String(tr || '').trim() || s.core;
@@ -479,7 +480,9 @@ async function translateSentencesViaTranslator(text, sentences) {
                 log.push({
                     original: s.core,
                     translated: cleaned,
-                    note: hasMixed ? 'mixed-word → whole sentence' : 'too many tokens',
+                    note: hasMixed ? 'mixed-word → whole sentence'
+                        : hasMulti ? 'multi-script word → whole sentence'
+                        : 'too many tokens → whole sentence',
                 });
             } catch (e) {
                 out += s.full;
@@ -489,7 +492,6 @@ async function translateSentencesViaTranslator(text, sentences) {
             continue;
         }
 
-        // Token-by-token
         let newCore = '';
         let tokCursor = 0;
         let anyError = null;
@@ -615,7 +617,7 @@ async function processMessage(mesId) {
     } finally {
         if (needsProfileSwitch && originalProfileName !== undefined) {
             try { await switchProfile(originalProfileName); }
-            catch (e) { console.warn(`[${extensionName}] Не удалось вернуть профиль`, e); }
+            catch (e) { console.warn(`${extensionName}: не удалось вернуть профиль`, e); }
         }
         $mes.removeClass('it-translating');
         inProgress.delete(mesId);
@@ -636,7 +638,7 @@ function refreshMessageText(mesId) {
             $text.text(msg.mes);
         }
     } catch (e) {
-        console.error(`[${extensionName}] Ошибка перерисовки:`, e);
+        console.error(`${extensionName}: ошибка перерисовки`, e);
         $text.text(msg.mes);
     }
 }
@@ -754,10 +756,13 @@ function getSettingsHtml() {
                     <label class="checkbox_label"><input type="checkbox" id="it_latin"><span>Переводить латиницу</span></label>
                 </div>
                 <div class="ec-setting-row">
+                    <label class="checkbox_label"><input type="checkbox" id="it_other"><span>Переводить прочие не-кириллические языки (греческий, иврит, тайский...)</span></label>
+                </div>
+                <div class="ec-setting-row">
                     <label class="checkbox_label"><input type="checkbox" id="it_skip_code"><span>Пропускать код-блоки</span></label>
                 </div>
                 <div class="ec-setting-row">
-                    <label class="checkbox_label"><input type="checkbox" id="it_skip_reasoning"><span>Не трогать &lt;think&gt; и reasoning-блоки</span></label>
+                    <label class="checkbox_label"><input type="checkbox" id="it_skip_tags"><span>Игнорировать текст внутри &lt;тегов&gt; (включая &lt;think&gt; и структурные блоки)</span></label>
                 </div>
                 <div class="ec-setting-row">
                     <label class="checkbox_label"><input type="checkbox" id="it_indicator"><span>Индикатор перевода</span></label>
@@ -811,11 +816,14 @@ function bindEvents() {
     $(document).on('change', '#it_latin', function () {
         s.translateLatin = $(this).prop('checked'); saveSettingsDebounced();
     });
+    $(document).on('change', '#it_other', function () {
+        s.translateOther = $(this).prop('checked'); saveSettingsDebounced();
+    });
     $(document).on('change', '#it_skip_code', function () {
         s.skipCodeBlocks = $(this).prop('checked'); saveSettingsDebounced();
     });
-    $(document).on('change', '#it_skip_reasoning', function () {
-        s.skipReasoning = $(this).prop('checked'); saveSettingsDebounced();
+    $(document).on('change', '#it_skip_tags', function () {
+        s.skipTags = $(this).prop('checked'); saveSettingsDebounced();
     });
     $(document).on('change', '#it_indicator', function () {
         s.showIndicator = $(this).prop('checked'); saveSettingsDebounced();
@@ -838,8 +846,9 @@ function loadSettingsUI() {
     $('#it_arabic').prop('checked', s.translateArabic);
     $('#it_cjk').prop('checked', s.translateCjk);
     $('#it_latin').prop('checked', s.translateLatin);
+    $('#it_other').prop('checked', s.translateOther);
     $('#it_skip_code').prop('checked', s.skipCodeBlocks);
-    $('#it_skip_reasoning').prop('checked', s.skipReasoning);
+    $('#it_skip_tags').prop('checked', s.skipTags);
     $('#it_indicator').prop('checked', s.showIndicator);
     $('#it_whitelist').val(s.whitelist);
 
@@ -877,5 +886,5 @@ jQuery(async () => {
         updateProfilesList();
     });
 
-    console.log(`${extensionName}: loaded v1.3.0`);
+    console.log(`${extensionName}: loaded v1.5.0`);
 });
