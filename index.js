@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS = {
     whitelist: 'HP, MP, XP, Lv, EXP, NPC, PvP, PvE, DnD, OOC, IC, PM, DM, GM',
     skipTags: true,
     showIndicator: true,
+    skipGreeting: true,
     connectionProfileId: '',
 };
 
@@ -46,10 +47,38 @@ const MAX_FRAGMENT_CACHE = 500;
 // ---------- state ----------
 
 let currentAbortController = null;
+let generating = false;
+const REQUEST_TIMEOUT_MS = 8000;
 const inProgress = new Set();
 const fragmentCache = new Map();
 let debugLog = [];
 const DEBUG_LOG_LIMIT = 50;
+
+// ---------- generation guard ----------
+
+function abortCurrentTranslation() {
+    if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+    }
+}
+
+async function waitForIdle(timeoutMs = 90000) {
+    const t0 = Date.now();
+    while (generating && Date.now() - t0 < timeoutMs) {
+        await new Promise((r) => setTimeout(r, 300));
+    }
+}
+
+function isGreetingMessage(mesId, msg) {
+    // Приветствие всегда стоит первым в чате; его свайпы - это альтернативные приветствия
+    return Number(mesId) === 0 && !msg.is_user;
+}
+
+async function processWhenIdle(mesId) {
+    await waitForIdle();
+    return processMessage(mesId);
+}
 
 // ---------- settings ----------
 
@@ -481,7 +510,7 @@ async function translateViaGoogle(text, targetLang, sourceLang = 'auto') {
     let lastError = null;
     for (const ep of endpoints) {
         try {
-            const res = await fetch(ep.url);
+            const res = await fetch(ep.url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             const parsed = ep.parse(data);
@@ -494,7 +523,7 @@ async function translateViaGoogle(text, targetLang, sourceLang = 'auto') {
         }
     }
     try {
-        const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|${encodeURIComponent(targetLang)}`);
+        const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|${encodeURIComponent(targetLang)}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
         if (!res.ok) throw new Error(`MyMemory HTTP ${res.status}`);
         const data = await res.json();
         if (data.responseStatus === 200 && data.responseData?.translatedText) {
@@ -517,6 +546,7 @@ async function translateViaDeepL(text, targetLang, apiKey) {
             'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({ text, target_lang: targetLang.toUpperCase() }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`DeepL: ${res.status}`);
     const data = await res.json();
@@ -534,7 +564,7 @@ async function translateViaLingva(text, targetLang, sourceLang = 'auto') {
         try {
             // Lingva ожидает zh или ja вместо zh-CN
             const slang = sourceLang.split('-')[0]; 
-            const res = await fetch(`${base}/api/v1/${slang}/${encodeURIComponent(targetLang)}/${encodeURIComponent(text)}`);
+            const res = await fetch(`${base}/api/v1/${slang}/${encodeURIComponent(targetLang)}/${encodeURIComponent(text)}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             if (data.translation) return data.translation;
@@ -714,6 +744,9 @@ async function processMessage(mesId) {
     if (!msg) return;
     if (msg.is_user || msg.is_system) return;
 
+    // Приветствие персонажа (самое первое сообщение чата) и его свайпы не трогаем
+    if (s.skipGreeting && isGreetingMessage(mesId, msg)) return;
+
     const swipeId = msg.swipe_id ?? 0;
     msg.extra = msg.extra || {};
     const translatedSwipes = msg.extra.itTranslatedSwipes || [];
@@ -753,7 +786,8 @@ async function processMessage(mesId) {
         }
     } catch (err) {
         if (err.name === 'AbortError') {
-            toastr.info('Перевод отменён');
+            // Тихо игнорируем: отмена при новой генерации или смене чата - нормальный сценарий
+            console.debug(`[${extensionName}] Перевод отменён`);
         } else {
             console.error(`[${extensionName}] Ошибка:`, err);
             toastr.error(`Перевод не удался: ${err.message}`);
@@ -911,6 +945,9 @@ function getSettingsHtml() {
                     <label class="checkbox_label"><input type="checkbox" id="it_skip_tags"><span>Игнорировать текст внутри &lt;тегов&gt; (включая &lt;think&gt; и структурные блоки)</span></label>
                 </div>
                 <div class="ec-setting-row">
+                    <label class="checkbox_label"><input type="checkbox" id="it_skip_greeting"><span>Не переводить приветствие (и его свайпы)</span></label>
+                </div>
+                <div class="ec-setting-row">
                     <label class="checkbox_label"><input type="checkbox" id="it_indicator"><span>Индикатор перевода</span></label>
                 </div>
 
@@ -976,6 +1013,9 @@ function bindEvents() {
     $(document).on('change', '#it_skip_tags', function () {
         s.skipTags = $(this).prop('checked'); saveSettingsDebounced();
     });
+    $(document).on('change', '#it_skip_greeting', function () {
+        s.skipGreeting = $(this).prop('checked'); saveSettingsDebounced();
+    });
     $(document).on('change', '#it_indicator', function () {
         s.showIndicator = $(this).prop('checked'); saveSettingsDebounced();
     });
@@ -999,6 +1039,7 @@ function loadSettingsUI() {
     $('#it_latin').prop('checked', s.translateLatin);
     $('#it_other').prop('checked', s.translateOther);
     $('#it_skip_tags').prop('checked', s.skipTags);
+    $('#it_skip_greeting').prop('checked', s.skipGreeting);
     $('#it_indicator').prop('checked', s.showIndicator);
     $('#it_whitelist').val(s.whitelist);
 
@@ -1020,13 +1061,26 @@ jQuery(async () => {
     loadSettingsUI();
     bindEvents();
 
+    // Следим за основной генерацией: при старте рубим наш перевод, чтобы он не мешал
+    if (event_types.GENERATION_STARTED) {
+        eventSource.on(event_types.GENERATION_STARTED, () => {
+            generating = true;
+            abortCurrentTranslation();
+        });
+    }
+    for (const ev of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
+        if (ev) eventSource.on(ev, () => { generating = false; });
+    }
+
     eventSource.on(event_types.MESSAGE_RECEIVED, (mesId) => {
-        processMessage(mesId).catch((e) => console.error(`[${extensionName}]`, e));
+        processWhenIdle(mesId).catch((e) => console.error(`[${extensionName}]`, e));
     });
     eventSource.on(event_types.MESSAGE_SWIPED, (mesId) => {
-        processMessage(mesId).catch((e) => console.error(`[${extensionName}]`, e));
+        processWhenIdle(mesId).catch((e) => console.error(`[${extensionName}]`, e));
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        generating = false;
+        abortCurrentTranslation();
         inProgress.clear();
         debugLog = [];
         updateProfilesList();
@@ -1036,5 +1090,5 @@ jQuery(async () => {
         updateProfilesList();
     });
 
-    console.log(`${extensionName}: loaded v1.6.1 (API lang detect + safe fallback)`);
+    console.log(`${extensionName}: loaded v1.6.3 (skip greeting option)`);
 });
