@@ -1,0 +1,12 @@
+{
+    "display_name": "Wild Translator",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "you",
+    "version": "1.1.0",
+    "description": "Detects foreign-language snippets in roleplay messages and replaces them in-place with translations. Supports LLM (with optional dedicated connection profile) and translator APIs (Google / DeepL / Lingva).",
+    "auto_update": false
+}
