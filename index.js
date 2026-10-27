@@ -26,7 +26,6 @@ const DEFAULT_SETTINGS = {
     translateLatin: true,
     translateOther: true,
     whitelist: 'HP, MP, XP, Lv, EXP, NPC, PvP, PvE, DnD, OOC, IC, PM, DM, GM',
-    skipCodeBlocks: true,
     skipTags: true,
     showIndicator: true,
     connectionProfileId: '',
@@ -42,11 +41,13 @@ const ARABIC_LETTER_RE = /\p{Script=Arabic}/u;
 const CJK_LETTER_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 const MAX_TOKEN_CALLS_PER_SENTENCE = 5;
+const MAX_FRAGMENT_CACHE = 500;
 
 // ---------- state ----------
 
 let currentAbortController = null;
 const inProgress = new Set();
+const fragmentCache = new Map();
 let debugLog = [];
 const DEBUG_LOG_LIMIT = 50;
 
@@ -70,6 +71,16 @@ function getWhitelist() {
 
 function isWhitelisted(word) {
     return getWhitelist().includes(String(word).toLowerCase());
+}
+
+// ---------- fragment cache ----------
+
+function setFragmentCacheEntry(key, value) {
+    if (fragmentCache.size >= MAX_FRAGMENT_CACHE) {
+        const oldest = fragmentCache.keys().next().value;
+        if (oldest !== undefined) fragmentCache.delete(oldest);
+    }
+    fragmentCache.set(key, value);
 }
 
 // ---------- connection profile helpers ----------
@@ -190,19 +201,83 @@ function needsTranslation(text) {
     return sentenceNeedsTranslation(text);
 }
 
+// ---------- fragment-level extraction (for fallback) ----------
+
+function extractForeignFragments(text) {
+    const tokens = [];
+    for (const m of text.matchAll(WORD_RE)) {
+        const word = m[0];
+        if (!wordHasForeignLetter(word)) continue;
+        if (isWhitelisted(word)) continue;
+        tokens.push({ text: word, index: m.index });
+    }
+    return tokens;
+}
+
+async function translateFragmentsInPlace(text) {
+    const fragments = extractForeignFragments(text);
+    if (!fragments.length) return { result: text, log: [] };
+
+    const s = getSettings();
+    let result = text;
+    let replaced = 0;
+    let cacheHits = 0;
+    const translatedPairs = [];
+    const logEntries = [];
+
+    for (let i = fragments.length - 1; i >= 0; i--) {
+        const frag = fragments[i];
+        const cacheKey = `${s.translatorService}|${s.targetLang}|${frag.text}`;
+
+        let tr;
+        if (fragmentCache.has(cacheKey)) {
+            tr = fragmentCache.get(cacheKey);
+            cacheHits++;
+        } else {
+            try {
+                tr = await translateSingle(frag.text);
+                setFragmentCacheEntry(cacheKey, tr);
+            } catch (e) {
+                console.warn(`${extensionName}: не удалось перевести фрагмент`, frag.text, e);
+                logEntries.push({
+                    original: frag.text,
+                    translated: frag.text,
+                    error: `fragment: ${e.message}`,
+                });
+                continue;
+            }
+        }
+
+        const trimmed = String(tr ?? '').trim();
+        if (!trimmed || trimmed === frag.text) continue;
+
+        result = result.slice(0, frag.index) + trimmed + result.slice(frag.index + frag.text.length);
+        replaced++;
+        translatedPairs.push({ from: frag.text, to: trimmed });
+        logEntries.push({
+            original: frag.text,
+            translated: trimmed,
+            note: 'fragment fallback',
+        });
+    }
+
+    if (replaced > 0) {
+        console.log(
+            `${extensionName}: fragment fallback: ${replaced}/${fragments.length} ` +
+            `(cache hits: ${cacheHits}, cache size: ${fragmentCache.size})`,
+            translatedPairs,
+        );
+    }
+
+    return { result, log: logEntries };
+}
+
 // ---------- tag protection ----------
 
-/**
- * Двухпроходная защита тегов:
- *  1) все парные блоки <tag ...>…</tag> целиком (тег + содержимое);
- *  2) оставшиеся одиночные/самозакрывающиеся <tag ...> / <tag ... /> в тексте.
- * Возвращает массив сегментов: {type: 'text'|'protected', content}.
- */
 function segmentText(text) {
     const s = getSettings();
     if (!s.skipTags) return [{ type: 'text', content: text }];
 
-    // Pass 1: paired blocks
     const pairedRe = /<(\w+)(?:\s[^>]*)?>[\s\S]*?<\/\1>/gi;
     const parts = [];
     let lastIdx = 0;
@@ -219,7 +294,6 @@ function segmentText(text) {
     }
     if (parts.length === 0) parts.push({ type: 'text', content: text });
 
-    // Pass 2: leftover standalone tags inside text parts
     const refined = [];
     for (const seg of parts) {
         if (seg.type === 'protected') { refined.push(seg); continue; }
@@ -247,20 +321,10 @@ function splitSentences(text) {
 }
 
 function findTranslatableSentences(text) {
-    const s = getSettings();
     const sentences = splitSentences(text);
     const result = [];
-    let inCode = false;
 
     for (const part of sentences) {
-        if (s.skipCodeBlocks) {
-            const codeCount = (part.match(/```/g) || []).length;
-            if (inCode) {
-                if (codeCount % 2 === 1) inCode = false;
-                continue;
-            }
-            if (codeCount % 2 === 1) { inCode = true; continue; }
-        }
         const lead = part.match(/^\s*/)[0];
         const trail = part.match(/\s*$/)[0];
         const core = part.slice(lead.length, part.length - trail.length);
@@ -316,11 +380,11 @@ async function safeGenerateRaw(promptText) {
 
 function buildLLMPrompt(items) {
     const list = items.map((it, i) => `${i + 1}. ${it}`).join('\n');
-    return `Ты — переводчик, встроенный в русскоязычный ролевой чат. Модель иногда вставляет в русский текст иноязычные вставки. Это может быть ЛЮБОЙ язык (английский, китайский, японский, арабский, корейский, греческий, иврит и т.п.), и в одном предложении могут встретиться вставки с РАЗНЫХ языков одновременно.
+    return `# Ты - переводчик, встроенный в русскоязычный ролевой чат. Модель иногда вставляет в русский текст иноязычные вставки. Это может быть ЛЮБОЙ язык (английский, китайский, японский, арабский, корейский, греческий, иврит и т.п.), и в одном предложении могут встретиться вставки с РАЗНЫХ языков одновременно.
 
-Твоя задача — вернуть ТО ЖЕ САМОЕ предложение, но с переведёнными на русский ТОЛЬКО теми частями, которые НЕ на русском. Каждую иноязычную вставку обрабатывай независимо от остальных.
+Твоя задача - вернуть ТО ЖЕ САМОЕ предложение, но с переведёнными на русский ТОЛЬКО теми частями, которые НЕ на русском. Каждую иноязычную вставку обрабатывай независимо от остальных.
 
-КРИТИЧЕСКИ ВАЖНО:
+# КРИТИЧЕСКИ ВАЖНО:
 - НЕ перефразируй русский текст.
 - НЕ меняй порядок слов.
 - НЕ меняй пунктуацию.
@@ -387,7 +451,12 @@ async function translateViaGoogle(text, targetLang) {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             const parsed = ep.parse(data);
-            if (parsed) return parsed;
+            if (parsed && parsed !== text) return parsed;
+            if (parsed === text) {
+                // Endpoint вернул тот же текст — пробуем следующий
+                lastError = new Error('endpoint вернул исходный текст');
+                continue;
+            }
             throw new Error('Непредвиденный формат ответа');
         } catch (e) {
             lastError = e;
@@ -474,7 +543,13 @@ async function translateSentencesViaTranslator(text, sentences) {
         if (tokens.length > MAX_TOKEN_CALLS_PER_SENTENCE || hasMixed || hasMulti) {
             try {
                 const tr = await translateSingle(s.core);
-                const cleaned = String(tr || '').trim() || s.core;
+                let cleaned = String(tr || '').trim() || s.core;
+
+                // FALLBACK: переводим предложение — могли остаться нетронутые вставки
+                // (типичный случай: Google вернул русский текст с CJK-словом как есть)
+                const fallback = await translateFragmentsInPlace(cleaned);
+                cleaned = fallback.result;
+
                 const replacement = s.lead + cleaned + s.trail;
                 out += replacement;
                 log.push({
@@ -484,6 +559,7 @@ async function translateSentencesViaTranslator(text, sentences) {
                         : hasMulti ? 'multi-script word → whole sentence'
                         : 'too many tokens → whole sentence',
                 });
+                log.push(...fallback.log);
             } catch (e) {
                 out += s.full;
                 log.push({ original: s.core, translated: s.core, error: e.message });
@@ -492,15 +568,31 @@ async function translateSentencesViaTranslator(text, sentences) {
             continue;
         }
 
+        // Per-token путь: каждое слово отдельно. Если API вернул то же слово —
+        // translateViaGoogle уже автоматически пробует следующий endpoint.
         let newCore = '';
         let tokCursor = 0;
         let anyError = null;
+        const perTokenFallbackLog = [];
         for (const tok of tokens) {
             if (tok.index < tokCursor) continue;
             newCore += s.core.slice(tokCursor, tok.index);
             try {
                 const tr = await translateSingle(tok.text);
-                newCore += (tr && String(tr).trim()) ? String(tr).trim() : tok.text;
+                const trimmed = String(tr ?? '').trim();
+                if (trimmed && trimmed !== tok.text) {
+                    newCore += trimmed;
+                } else {
+                    // Second-chance: переводим этот же токен через fragment-обёртку
+                    // (пойдёт в кэш и/или другой endpoint)
+                    const frag = await translateFragmentsInPlace(tok.text);
+                    if (frag.result !== tok.text) {
+                        newCore += frag.result;
+                        perTokenFallbackLog.push(...frag.log);
+                    } else {
+                        newCore += tok.text;
+                    }
+                }
             } catch (e) {
                 newCore += tok.text;
                 anyError = e.message;
@@ -516,6 +608,7 @@ async function translateSentencesViaTranslator(text, sentences) {
             translated: newCore,
             error: anyError,
         });
+        log.push(...perTokenFallbackLog);
         cursor = idx + s.full.length;
     }
     out += text.slice(cursor);
@@ -542,8 +635,12 @@ async function translateText(text) {
         }
         if (s.mode === 'llm') {
             const { result, log: entries } = await translateSentencesViaLLM(seg.content, sentences);
-            parts.push(result);
+            // FALLBACK для LLM-режима: если LLM что-то оставила как есть —
+            // добиваем через сервис переводчика (Google/DeepL/Lingva)
+            const fallback = await translateFragmentsInPlace(result);
+            parts.push(fallback.result);
             log.push(...entries);
+            log.push(...fallback.log);
         } else {
             const { result, log: entries } = await translateSentencesViaTranslator(seg.content, sentences);
             parts.push(result);
@@ -697,7 +794,7 @@ function getSettingsHtml() {
     <div id="it-settings" class="it-container">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Inline Translator</b>
+                <b>WILD TRANSLATOR</b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -759,9 +856,6 @@ function getSettingsHtml() {
                     <label class="checkbox_label"><input type="checkbox" id="it_other"><span>Переводить прочие не-кириллические языки (греческий, иврит, тайский...)</span></label>
                 </div>
                 <div class="ec-setting-row">
-                    <label class="checkbox_label"><input type="checkbox" id="it_skip_code"><span>Пропускать код-блоки</span></label>
-                </div>
-                <div class="ec-setting-row">
                     <label class="checkbox_label"><input type="checkbox" id="it_skip_tags"><span>Игнорировать текст внутри &lt;тегов&gt; (включая &lt;think&gt; и структурные блоки)</span></label>
                 </div>
                 <div class="ec-setting-row">
@@ -796,7 +890,11 @@ function bindEvents() {
         s.mode = $(this).val(); saveSettingsDebounced(); updateConditionalVisibility();
     });
     $(document).on('change', '#it_service', function () {
-        s.translatorService = $(this).val(); saveSettingsDebounced(); updateConditionalVisibility();
+        s.translatorService = $(this).val();
+        // Кэш привязан к сервису — сбрасываем
+        fragmentCache.clear();
+        saveSettingsDebounced();
+        updateConditionalVisibility();
     });
     $(document).on('change', '#it-connection-profile', function () {
         s.connectionProfileId = $(this).val() || ''; saveSettingsDebounced();
@@ -805,7 +903,11 @@ function bindEvents() {
         s.deeplApiKey = $(this).val(); saveSettingsDebounced();
     });
     $(document).on('input', '#it_lang', function () {
-        s.targetLang = $(this).val().trim() || 'ru'; saveSettingsDebounced();
+        const v = $(this).val().trim() || 'ru';
+        // Кэш привязан к целевому языку — сбрасываем при смене
+        if (v !== s.targetLang) fragmentCache.clear();
+        s.targetLang = v;
+        saveSettingsDebounced();
     });
     $(document).on('change', '#it_arabic', function () {
         s.translateArabic = $(this).prop('checked'); saveSettingsDebounced();
@@ -818,9 +920,6 @@ function bindEvents() {
     });
     $(document).on('change', '#it_other', function () {
         s.translateOther = $(this).prop('checked'); saveSettingsDebounced();
-    });
-    $(document).on('change', '#it_skip_code', function () {
-        s.skipCodeBlocks = $(this).prop('checked'); saveSettingsDebounced();
     });
     $(document).on('change', '#it_skip_tags', function () {
         s.skipTags = $(this).prop('checked'); saveSettingsDebounced();
@@ -847,7 +946,6 @@ function loadSettingsUI() {
     $('#it_cjk').prop('checked', s.translateCjk);
     $('#it_latin').prop('checked', s.translateLatin);
     $('#it_other').prop('checked', s.translateOther);
-    $('#it_skip_code').prop('checked', s.skipCodeBlocks);
     $('#it_skip_tags').prop('checked', s.skipTags);
     $('#it_indicator').prop('checked', s.showIndicator);
     $('#it_whitelist').val(s.whitelist);
@@ -886,5 +984,5 @@ jQuery(async () => {
         updateProfilesList();
     });
 
-    console.log(`${extensionName}: loaded v1.5.0`);
+    console.log(`${extensionName}: loaded v1.6.0 (fragment fallback + cache)`);
 });
