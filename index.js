@@ -205,11 +205,26 @@ function needsTranslation(text) {
 
 function extractForeignFragments(text) {
     const tokens = [];
+    // Регулярка для выделения кусков текста по алфавитам
+    const SCRIPT_RUN_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[A-Za-z]+|[\p{Script=Arabic}]+|[\p{Script=Cyrillic}]+/gu;
+
     for (const m of text.matchAll(WORD_RE)) {
         const word = m[0];
         if (!wordHasForeignLetter(word)) continue;
         if (isWhitelisted(word)) continue;
-        tokens.push({ text: word, index: m.index });
+
+        // Если слово смешанное (например, "大丈夫ными"), разбиваем его
+        const runs = [...word.matchAll(SCRIPT_RUN_RE)];
+        if (runs.length > 1) {
+            for (const run of runs) {
+                const part = run[0];
+                // Отправляем на перевод только те куски, где есть иностранные буквы
+                if (!wordHasForeignLetter(part) || isWhitelisted(part)) continue;
+                tokens.push({ text: part, index: m.index + run.index });
+            }
+        } else {
+            tokens.push({ text: word, index: m.index });
+        }
     }
     return tokens;
 }
@@ -431,16 +446,16 @@ async function translateSentencesViaLLM(text, sentences) {
 
 // ---------- Translator APIs ----------
 
-async function translateViaGoogle(text, targetLang) {
+async function translateViaGoogle(text, targetLang, sourceLang = 'auto') {
     const endpoints = [
         {
-            url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`,
+            url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`,
             parse: (d) => Array.isArray(d) && Array.isArray(d[0])
                 ? d[0].map((p) => p[0]).join('')
                 : null,
         },
         {
-            url: `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${encodeURIComponent(targetLang)}&q=${encodeURIComponent(text)}`,
+            url: `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sourceLang}&tl=${encodeURIComponent(targetLang)}&q=${encodeURIComponent(text)}`,
             parse: (d) => Array.isArray(d) && typeof d[0] === 'string' ? d.join('') : null,
         },
     ];
@@ -451,28 +466,28 @@ async function translateViaGoogle(text, targetLang) {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             const parsed = ep.parse(data);
-            if (parsed && parsed !== text) return parsed;
-            if (parsed === text) {
-                // Endpoint вернул тот же текст — пробуем следующий
-                lastError = new Error('endpoint вернул исходный текст');
-                continue;
-            }
-            throw new Error('Непредвиденный формат ответа');
+            
+            // Если получили хоть какой-то текст — возвращаем его (даже если это оригинал)
+            if (parsed !== null && parsed !== undefined) return parsed;
+            
         } catch (e) {
             lastError = e;
         }
     }
     try {
-        const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=auto|${encodeURIComponent(targetLang)}`);
+        const res = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${sourceLang}|${encodeURIComponent(targetLang)}`);
         if (!res.ok) throw new Error(`MyMemory HTTP ${res.status}`);
         const data = await res.json();
         if (data.responseStatus === 200 && data.responseData?.translatedText) {
             return data.responseData.translatedText;
         }
-        throw new Error('MyMemory: нет перевода');
     } catch (e) {
-        throw new Error(`Все Google endpoints и MyMemory не сработали (${lastError?.message || ''} / ${e.message})`);
+        lastError = e;
     }
+    
+    // Если всё упало — просто возвращаем оригинал, не ломая работу расширения
+    console.warn(`[${extensionName}] Все API не сработали для "${text}", возвращаю оригинал.`);
+    return text;
 }
 
 async function translateViaDeepL(text, targetLang, apiKey) {
@@ -489,7 +504,7 @@ async function translateViaDeepL(text, targetLang, apiKey) {
     return data.translations?.[0]?.text ?? '';
 }
 
-async function translateViaLingva(text, targetLang) {
+async function translateViaLingva(text, targetLang, sourceLang = 'auto') {
     const instances = [
         'https://lingva.ml',
         'https://lingva.garudalinux.org',
@@ -498,23 +513,33 @@ async function translateViaLingva(text, targetLang) {
     let lastError = null;
     for (const base of instances) {
         try {
-            const res = await fetch(`${base}/api/v1/auto/${encodeURIComponent(targetLang)}/${encodeURIComponent(text)}`);
+            // Lingva ожидает zh или ja вместо zh-CN
+            const slang = sourceLang.split('-')[0]; 
+            const res = await fetch(`${base}/api/v1/${slang}/${encodeURIComponent(targetLang)}/${encodeURIComponent(text)}`);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             if (data.translation) return data.translation;
-            throw new Error('Пустой ответ');
         } catch (e) {
             lastError = e;
         }
     }
-    throw new Error(`Все Lingva-инстансы недоступны (${lastError?.message || ''})`);
+    return text; // Если всё упало — возвращаем оригинал
 }
 
 async function translateSingle(text) {
     const s = getSettings();
-    if (s.translatorService === 'google') return translateViaGoogle(text, s.targetLang);
+    
+    // Авто-определение исходного языка по скрипту для лучшей работы API
+    let sl = 'auto';
+    if (/[\p{Script=Han}]/u.test(text)) sl = 'zh-CN';
+    else if (/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text)) sl = 'ja';
+    else if (/[\p{Script=Hangul}]/u.test(text)) sl = 'ko';
+    else if (/[\p{Script=Arabic}]/u.test(text)) sl = 'ar';
+    else if (/[A-Za-z]/.test(text)) sl = 'en';
+
+    if (s.translatorService === 'google') return translateViaGoogle(text, s.targetLang, sl);
     if (s.translatorService === 'deepl') return translateViaDeepL(text, s.targetLang, s.deeplApiKey);
-    if (s.translatorService === 'lingva') return translateViaLingva(text, s.targetLang);
+    if (s.translatorService === 'lingva') return translateViaLingva(text, s.targetLang, sl);
     throw new Error('Неизвестный сервис перевода');
 }
 
@@ -541,29 +566,37 @@ async function translateSentencesViaTranslator(text, sentences) {
         const hasMulti = tokens.some((t) => t.script === 'multi');
 
         if (tokens.length > MAX_TOKEN_CALLS_PER_SENTENCE || hasMixed || hasMulti) {
+            let cleaned = s.core;
+            let trError = null;
+            
             try {
                 const tr = await translateSingle(s.core);
-                let cleaned = String(tr || '').trim() || s.core;
+                cleaned = String(tr || '').trim() || s.core;
+            } catch (e) {
+                trError = e.message;
+            }
 
-                // FALLBACK: переводим предложение — могли остаться нетронутые вставки
-                // (типичный случай: Google вернул русский текст с CJK-словом как есть)
+            // FALLBACK: Всегда запускаем дробление, даже если основная модель/API упала
+            try {
                 const fallback = await translateFragmentsInPlace(cleaned);
                 cleaned = fallback.result;
-
-                const replacement = s.lead + cleaned + s.trail;
-                out += replacement;
-                log.push({
-                    original: s.core,
-                    translated: cleaned,
-                    note: hasMixed ? 'mixed-word → whole sentence'
-                        : hasMulti ? 'multi-script word → whole sentence'
-                        : 'too many tokens → whole sentence',
-                });
                 log.push(...fallback.log);
             } catch (e) {
-                out += s.full;
-                log.push({ original: s.core, translated: s.core, error: e.message });
+                log.push({ original: cleaned, translated: cleaned, error: `fragment fallback: ${e.message}` });
             }
+
+            const replacement = s.lead + cleaned + s.trail;
+            out += replacement;
+            
+            log.push({
+                original: s.core,
+                translated: cleaned,
+                note: hasMixed ? 'mixed-word → whole sentence'
+                    : hasMulti ? 'multi-script word → whole sentence'
+                    : 'too many tokens → whole sentence',
+                error: trError
+            });
+            
             cursor = idx + s.full.length;
             continue;
         }
@@ -984,5 +1017,5 @@ jQuery(async () => {
         updateProfilesList();
     });
 
-    console.log(`${extensionName}: loaded v1.6.0 (fragment fallback + cache)`);
+    console.log(`${extensionName}: loaded v1.6.1 (API lang detect + safe fallback)`);
 });
