@@ -39,8 +39,8 @@
 .mes.it-translating .mes_text::after {
     content: '';
     position: absolute;
-    right: 6px;
-    top: 6px;
+    right: 0px;
+    top: -4px;
     width: 14px;
     height: 14px;
     border: 2px solid var(--SmartThemeBorderColor, #888);
